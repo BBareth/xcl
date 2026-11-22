@@ -401,8 +401,9 @@ fn why(_at: u64, msg: &str) {
 type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
-/// the prelude) – console code that loops on what XCL passed it wrong (an address, a count)
-/// must not run on the PC GPU until the driver resets it. Once the budget is spent every loop
+/// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
+/// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
+/// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
 

@@ -505,3 +505,45 @@ fn print_graphics_root_argument_capacity() {
         }
     }
 }
+
+/// A vertex and a pixel shader of the console's compiler that read root constants and a root
+/// CBV – translated, drawn with the arguments passed as on a console list's draw
+/// (`console_list::user_data_gfx`: from s8, the rest in the table at s[0:1]): the pixels have
+/// the values the arguments give.
+#[test]
+fn console_compiled_graphics_reads_its_root_arguments() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32_FLOAT;
+    let Some(c) = console_compiler() else { return };
+    if runner::adapter().is_err() {
+        return;
+    }
+    let common = "cbuffer k : register(b0) { float k0; float k1; float k2; float k3; };\ncbuffer m : register(b1) { float4 m0; float4 m1; };\n#define ROOT [RootSignature(\"RootConstants(num32BitConstants=4, b0), CBV(b1)\")]\n";
+    let vs = format!("{common}struct O {{ float4 p : SV_Position; float4 c : COLOR0; }};\nROOT O main(float3 pos : POSITION) {{ O o; o.p = float4(pos.xy * k2, 0.5, 1.0); o.c = m1 * k3; return o; }}\n");
+    let ps = format!("{common}ROOT float4 main(float4 p : SV_Position, float4 c : COLOR0) : SV_Target {{ return float4(k0, k1, m0.x + c.x, m0.y + c.y); }}\n");
+    let vs_blob = console_compile(&c, &vs, &["-E", "main", "-T", "vs_6_6"]).unwrap_or_else(|e| panic!("VS: {e}"));
+    let ps_blob = console_compile(&c, &ps, &["-E", "main", "-T", "ps_6_6"]).unwrap_or_else(|e| panic!("PS: {e}"));
+    let vs_dxil = pso::console_to_dxil(&vs_blob, pso::Stage::Vertex, 0).unwrap_or_else(|e| panic!("VS translation: {e}")).dxil;
+    let ps_dxil = pso::console_to_dxil(&ps_blob, pso::Stage::Pixel, 0).unwrap_or_else(|e| panic!("PS translation: {e}")).dxil;
+    // root arguments: 4 constants (0.25, 0.5, 2.0 – the position scale, 0.5), the CBV's address
+    let (cbv, table_at) = (0x1000usize, 0x100usize);
+    let layout = console_list::layout_from_blob(&vs_blob).expect("RTS0");
+    let mut args: Vec<u8> = [0.25f32, 0.5, 2.0, 0.5].iter().flat_map(|f| f.to_le_bytes()).collect();
+    args.extend((cbv as u64).to_le_bytes());
+    let mut mem = vec![0u32; 0x2000 / 4];
+    for (k, f) in [0.125f32, 0.0625, 0.0, 0.0, 0.5, 0.25, 0.0, 0.0].iter().enumerate() {
+        mem[cbv / 4 + k] = f.to_bits();
+    }
+    for (k, b) in args[layout.inline_gfx as usize..].iter().enumerate() {
+        mem[(table_at + k) / 4] |= (*b as u32) << (8 * (k % 4));
+    }
+    let sgprs = console_list::user_data_gfx(&layout, &args, table_at as u64);
+    // a triangle over the whole target (positions doubled by k2 = 2)
+    let tri = [-0.5f32, -0.5, 0.0, 1.5, -0.5, 0.0, -0.5, 1.5, 0.0];
+    let el = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32_FLOAT, offset: 0 }];
+    let px = runner::draw(&vs_dxil, &ps_dxil, &el, &tri, 12, &sgprs, &mem, 8, [9.0; 4]).unwrap_or_else(|e| panic!("draw: {e}"));
+    // k0, k1, m0.x + m1.x · k3, m0.y + m1.y · k3
+    let want = [0.25f32, 0.5, 0.125 + 0.25, 0.0625 + 0.125];
+    let p = px[4 * 8 + 4];
+    println!("pixel {p:?}, want {want:?}");
+    assert!(p.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "pixel {p:?}, want {want:?}");
+}

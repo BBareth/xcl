@@ -63,6 +63,21 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     if res == 0 {
         return 0;
     }
+    if trace_frame() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 3 || n % 50 == 0 {
+            let u = USES.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or_default();
+            let d = ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc()).map(|d| (d.Width, d.Height, d.Format.0, d.Flags.0));
+            let busiest: Vec<String> = {
+                let g = USES.lock().unwrap();
+                let mut v: Vec<(usize, [u64; 4])> = g.as_ref().map(|m| m.iter().map(|(&k, &u)| (k, u)).collect()).unwrap_or_default();
+                v.sort_by_key(|(_, u)| std::cmp::Reverse(u[0] + u[1] + u[2]));
+                v.iter().take(6).map(|(k, u)| format!("{k:#x}: rt {} uav {} copy {} clear {}", u[0], u[1], u[2], u[3])).collect()
+            };
+            crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
+        }
+    }
     {
         let mut c = CANDIDATE.lock().unwrap();
         if c.map(|(_, r)| r) != Some(res) {
@@ -120,6 +135,31 @@ pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
     }
 }
 
+/// `XCL_TRACE_FRAME=1`: what console code does with each resource it later presents –
+/// render-target binds, UAV views, copy destinations, clears (logged at the first presents)
+static USES: Mutex<Option<HashMap<usize, [u64; 4]>>> = Mutex::new(None);
+pub const USE_RT: usize = 0;
+pub const USE_UAV: usize = 1;
+pub const USE_COPY: usize = 2;
+pub const USE_CLEAR: usize = 3;
+
+pub fn trace_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FRAME").is_some())
+}
+
+/// `res` was used as `what` (USE_*)
+pub fn note_use(res: usize, what: usize) {
+    if trace_frame() && res != 0 {
+        USES.lock().unwrap().get_or_insert_with(HashMap::new).entry(res).or_default()[what] += 1;
+    }
+}
+
+/// the resource an RTV handle names (render-target binds)
+pub fn rtv_resource(handle: usize) -> Option<usize> {
+    RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
+}
+
 pub fn note_rt0(list: usize, handle: usize) {
     if !enabled() {
         return;
@@ -151,7 +191,22 @@ unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     ok.then_some(d)
 }
 
+/// queues the title submitted work to (AddRef'd: they stay valid for `drain`)
+static QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// The queues the title submitted work to.
+pub fn known_queues() -> Vec<usize> {
+    QUEUES.lock().unwrap().clone()
+}
+
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
+    {
+        let mut q = QUEUES.lock().unwrap();
+        if !q.contains(&(queue as usize)) {
+            add_ref(queue as usize);
+            q.push(queue as usize);
+        }
+    }
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;
     }
@@ -408,7 +463,19 @@ unsafe fn present_now(min_interval: Duration) {
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
     p.list.CopyResource(&bb, src);
-    let dump = frame_dump_due().then(|| readback_copy(&p.list, src, &desc)).flatten();
+    let due = frame_dump_due();
+    let dump = due.then(|| readback_copy(&p.list, src, &desc)).flatten();
+    // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
+    let rt_dump = if due && trace_frame() {
+        busiest_rt().and_then(|r| {
+            let rr = r as *mut c_void;
+            let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
+            let d = res.GetDesc();
+            readback_copy(&p.list, &res, &d).map(|x| (x, d.Format))
+        })
+    } else {
+        None
+    };
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
@@ -427,7 +494,10 @@ unsafe fn present_now(min_interval: Duration) {
             let _ = p.fence.SetEventOnCompletion(p.value, p.event);
             WaitForSingleObject(p.event, 2000);
         }
-        write_frame(&rb, &fp, desc.Format);
+        write_frame(&rb, &fp, desc.Format, "frame");
+    }
+    if let Some(((rb, fp), f)) = rt_dump {
+        write_frame(&rb, &fp, f, "rt");
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
@@ -484,11 +554,32 @@ fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
         DXGI_FORMAT_R10G10B10A2_UNORM => [(t >> 2 & 0xFF) as u8, (t >> 12 & 0xFF) as u8, (t >> 22 & 0xFF) as u8],
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => [t as u8, (t >> 8) as u8, (t >> 16) as u8],
         DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => [(t >> 16) as u8, (t >> 8) as u8, t as u8],
+        // HDR: tone-mapped for viewing
+        DXGI_FORMAT_R11G11B10_FLOAT => {
+            let tm = |v: f32| ((v / (1.0 + v)).sqrt() * 255.0) as u8;
+            [tm(small_float(t & 0x7FF, 6)), tm(small_float(t >> 11 & 0x7FF, 6)), tm(small_float(t >> 22, 5))]
+        }
         _ => return None,
     })
 }
 
-unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT) {
+/// the resource bound as a render target most often (`XCL_TRACE_FRAME`)
+fn busiest_rt() -> Option<usize> {
+    USES.lock().unwrap().as_ref()?.iter().filter(|(_, u)| u[USE_RT] > 0).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
+}
+
+/// an 11- / 10-bit unsigned float (5-bit exponent) -> f32
+fn small_float(v: u32, mantissa_bits: u32) -> f32 {
+    let (e, m) = (v >> mantissa_bits, v & ((1 << mantissa_bits) - 1));
+    let m = m as f32 / (1u32 << mantissa_bits) as f32;
+    match e {
+        0 => m * 2f32.powi(-14),
+        31 => 65504.0,
+        _ => (1.0 + m) * 2f32.powi(e as i32 - 15),
+    }
+}
+
+unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str) {
     let mut p: *mut c_void = std::ptr::null_mut();
     if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
         return;
@@ -508,10 +599,12 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
         bmp.extend_from_slice(&0u32.to_le_bytes());
     }
     let (mut lit, mut decoded) = (0usize, true);
+    let mut raw: HashMap<u32, usize> = HashMap::new();
     for y in (0..oh).rev() {
         let start = bmp.len();
         for x in 0..ow {
             let t = ((p as *const u8).add(fp.Offset as usize + 4 * y * pitch + 16 * x) as *const u32).read_unaligned();
+            *raw.entry(t).or_default() += 1;
             let c = rgb(format, t).unwrap_or_else(|| {
                 decoded = false;
                 [0; 3]
@@ -526,15 +619,18 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     rb.Unmap(0, None);
     let n = PRESENTS.load(Ordering::Relaxed);
     let Some(boot) = crate::state::boot() else { return };
-    let path = boot.logs_dir().join(format!("frame_{n}.bmp"));
+    let path = boot.logs_dir().join(format!("{tag}_{n}.bmp"));
     let _ = std::fs::write(&path, &bmp);
     crate::xlog_info!(
-        "present: frame {n} ({w}x{h}, format {}) written to {} – {lit} of {} samples not black{}",
+        "present: {tag} {n} ({w}x{h}, format {}) written to {} – {lit} of {} samples not black{}",
         format.0,
         path.display(),
         ow * oh,
         if decoded { "" } else { " (format not decoded)" }
     );
+    let mut top: Vec<(u32, usize)> = raw.into_iter().collect();
+    top.sort_by_key(|x| std::cmp::Reverse(x.1));
+    crate::xlog_info!("present: {tag} {n} raw texels (most common): {}", top.iter().take(6).map(|(v, c)| format!("{v:#010x}×{c}")).collect::<Vec<_>>().join(" "));
 }
 
 impl Drop for Presenter {

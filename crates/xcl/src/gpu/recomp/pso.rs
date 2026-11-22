@@ -25,7 +25,7 @@ pub fn is_console(blob: &[u8]) -> bool {
 
 /// Memory windows of the title's unified memory (1 without it).
 pub fn mem_windows() -> u32 {
-    crate::gpu::uma::get().map_or(1, |u| u.windows() as u32)
+    crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32)
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.

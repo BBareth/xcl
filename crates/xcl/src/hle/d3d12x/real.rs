@@ -239,6 +239,9 @@ unsafe fn open_uma(device: &ID3D12Device) {
             crate::xlog_info!("D3D12.X: UMA ({} MB, {} window(s)) opened as GPU heaps, window 0 buffer at VA {:#x}", u.size() >> 20, w.len(), w[0].1);
             *UMA_HEAPS.lock().unwrap() = w.iter().map(|x| x.2).collect();
             *UMA_BUFFER.lock().unwrap() = w.iter().map(|x| (x.0, x.1)).collect();
+            // the title's own reservations: sparse windows after these
+            let sparse = super::sparse::init(device);
+            UMA_BUFFER.lock().unwrap().extend(sparse);
         }
         Err(e) => {
             crate::xlog_warn!("D3D12.X: UMA not available to the GPU: {e}");
@@ -321,6 +324,16 @@ pub fn init() -> Result<String, String> {
                     d.EnableDebugLayer();
                     crate::xlog_info!("D3D12: debug layer enabled");
                 }
+            }
+        }
+        // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
+        // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
+        // stalled in its first seconds twice.
+        let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
+        if std::env::var_os("XCL_DRED").is_some() && D3D12GetDebugInterface(&mut dred).is_ok() {
+            if let Some(d) = dred {
+                d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
@@ -690,6 +703,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (17, l::copy_resource_x as usize),
                 (13, b::draw_indexed_instanced as usize),
                 (14, b::dispatch as usize),
+                (48, l::ia_set_vertex_buffers_x as usize),
+                (59, b::execute_indirect as usize),
+                (83, l::copy_texture_region_flags_x as usize),
                 (34, b::set_graphics_root_signature as usize),
                 (36, b::set_graphics_root_table as usize),
                 (38, b::set_graphics_root_constant as usize),
@@ -973,6 +989,15 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     if bytes == 0 || va - base + bytes > size {
         return None;
     }
+    // the title's own memory (a sparse window): a resource over its video-memory tiles
+    if u.is_sparse(va) {
+        let (hr, delta) = super::sparse::place_buffer(this, va, &d, state, riid, ppv)?;
+        UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+        if delta != 0 {
+            BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
+        }
+        return Some(hr);
+    }
     let heap = *UMA_HEAPS.lock().unwrap().get(k)?;
     d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -1016,7 +1041,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     if hr >= 0 {
         return hr;
     }
-    match super::title_textures::address(this as usize) {
+    match super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {
         Some(p) => {
             if !data.is_null() {
                 *data = p as *mut c_void;
@@ -1033,6 +1058,14 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
             hr
         }
     }
+}
+
+/// resources the title placed at its own address that got a PC resource of their own: on the
+/// console Map gives that address (the CPU's view of the resource)
+static TITLE_ADDRESS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+pub(super) fn note_title_address(res: usize, va: usize) {
+    TITLE_ADDRESS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, va);
 }
 
 /// resources whose Map gave their unified-memory address (no PC mapping to undo)
@@ -1056,6 +1089,10 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
+        if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+            m.remove(&(this as usize));
+        }
+        super::sparse::forget_buffer(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
@@ -1273,7 +1310,15 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+    super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
+    if super::present::trace_frame() {
+        let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+        if d.is_some_and(|d| d.Width >= 1920 && d.Flags.0 & 1 != 0) {
+            let s = super::console_heap::slot(cpu);
+            crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
+        }
+    }
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
     f(this, res, counter, desc, slot.pc_uav);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
@@ -1431,6 +1476,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("DrawIndexedInstanced", cl_draw_indexed_instanced as usize),
             ("SetPipelineState", cl_set_pipeline_state as usize),
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
+            ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
         ]),
         Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
@@ -1588,7 +1634,39 @@ creator!(dev_create_reserved_resource, "CreateReservedResource", Kind::Resource,
 creator!(dev_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
 creator!(dev_create_heap, "CreateHeap", Kind::Heap, [a1]);
 creator!(dev_create_heap1, "CreateHeap1", Kind::Heap, [a1, a2]);
-creator!(dev_create_fence, "CreateFence", Kind::Fence, [a1, a2]);
+creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
+
+/// fences created through the device (AddRef'd: they are released at the end only)
+static FENCES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// CreateFence: as on the PC; the fence is remembered for `end_title`
+unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flags: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = dev_create_fence_pc(this, value, flags, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        let add: RefFn = std::mem::transmute(*vt(*ppv).add(1));
+        add(*ppv);
+        FENCES.lock().unwrap().push(*ppv as usize);
+    }
+    hr
+}
+
+/// End the title on purpose without leaving the process stuck in the driver: every fence it
+/// created is signalled to the largest value (GPU waits on values the title would have signalled
+/// later complete), the queues drain, and the process ends without running DLL detach code.
+pub fn end_title(code: u32) -> ! {
+    unsafe {
+        for &f in FENCES.lock().unwrap().iter() {
+            let fr = f as *mut c_void;
+            if let Some(f) = ID3D12Fence::from_raw_borrowed(&fr) {
+                let _ = f.Signal(u64::MAX);
+            }
+        }
+        drain_gpu();
+        crate::log::flush();
+        windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
+    }
+    std::process::abort()
+}
 creator!(dev_create_query_heap, "CreateQueryHeap", Kind::QueryHeap, [a1]);
 creator!(dev_create_command_signature, "CreateCommandSignature", Kind::CommandSignature, [a1, a2]);
 creator!(dev_create_pipeline_library, "CreatePipelineLibrary", Kind::PipelineLibrary, [a1, a2]);
@@ -2489,14 +2567,52 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
+    if super::present::trace_frame() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 12 {
+            let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc()).map(|d| (d.Width, d.Height, d.Format.0));
+            crate::xlog_info!("frame trace: CreateRenderTargetView {handle:#x} → {res:p} {d:?}");
+        }
+    }
+}
+
+/// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
+unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
+    type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearRenderTargetView")));
+    if super::present::trace_frame() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_info!("frame trace: ClearRenderTargetView {rtv:#x} → {:?} colour {:?}, {n} rects", super::present::rtv_resource(rtv), color.as_ref());
+        }
+        if let Some(r) = super::present::rtv_resource(rtv) {
+            super::present::note_use(r, super::present::USE_CLEAR);
+        }
+    }
+    f(this, rtv, color, n, rects)
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
+    if super::present::trace_frame() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 12 {
+            let first = if n > 0 && !rtvs.is_null() { *rtvs } else { 0 };
+            crate::xlog_info!("frame trace: OMSetRenderTargets({n}, first {first:#x} → {:?}, single {single}, dsv {:?})", super::present::rtv_resource(first), dsv.as_ref().copied());
+        }
+    }
     if n > 0 && !rtvs.is_null() {
         super::present::note_rt0(this as usize, *rtvs);
+        if super::present::trace_frame() {
+            for k in 0..n as usize {
+                let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
+                if let Some(r) = super::present::rtv_resource(h) {
+                    super::present::note_use(r, super::present::USE_RT);
+                }
+            }
+        }
     }
 }
 
@@ -2592,7 +2708,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh();
+    super::title_textures::refresh(this);
     if n == 0 || lists.is_null() {
         f(this, n, lists);
         stop_if_device_removed();
@@ -2609,6 +2725,74 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     stop_if_device_removed();
 }
 
+/// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
+/// used (before the process ends on purpose).
+pub fn drain_gpu() {
+    let raw = device_raw();
+    let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
+    unsafe {
+        // a fence per queue (they finish in any order)
+        let mut fences = Vec::new();
+        for q in super::present::known_queues() {
+            let qr = q as *mut c_void;
+            let (Some(q), Ok(f)) = (ID3D12CommandQueue::from_raw_borrowed(&qr), dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)) else { continue };
+            if q.Signal(&f, 1).is_ok() {
+                fences.push(f);
+            }
+        }
+        let start = std::time::Instant::now();
+        while fences.iter().any(|f| f.GetCompletedValue() < 1) && start.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+/// If the device was removed: the reason, DRED's page fault (address, the allocations around
+/// it) and the operations each command list got to – into the log, once.
+pub fn log_device_removed() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let raw = device_raw();
+    let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
+    let Err(e) = (unsafe { dev.GetDeviceRemovedReason() }) else { return };
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    unsafe {
+        let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
+        if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
+            let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
+                let mut v = Vec::new();
+                while !n.is_null() && v.len() < 8 {
+                    let a = &*n;
+                    let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
+                    v.push(format!("type {} {}", a.AllocationType.0, name));
+                    n = a.pNext;
+                }
+                v.join(", ")
+            };
+            let va = pf.PageFaultVA;
+            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+        }
+        if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
+            let mut n = bc.pHeadAutoBreadcrumbNode;
+            let mut k = 0;
+            while !n.is_null() && k < 64 {
+                let node = &*n;
+                let count = node.BreadcrumbCount as usize;
+                let done = if node.pLastBreadcrumbValue.is_null() { 0 } else { *node.pLastBreadcrumbValue as usize };
+                if done < count {
+                    let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
+                    crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                }
+                n = node.pNext;
+                k += 1;
+            }
+        }
+    }
+}
+
 /// The GPU hung or the device was removed: the title is stopped at once (a title that goes on
 /// submitting work to a hung device can keep the driver from recovering), with the reason in
 /// the log and the report.
@@ -2616,6 +2800,7 @@ pub fn stop_if_device_removed() {
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
+        log_device_removed();
         let msg = format!("the D3D12 device was removed ({:#x}: {}) – the title is stopped", e.code().0 as u32, e.message());
         crate::xlog_error!("{msg}");
         crate::report::write_final(Some(msg));

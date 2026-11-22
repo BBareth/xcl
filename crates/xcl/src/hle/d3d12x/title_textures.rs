@@ -84,7 +84,7 @@ pub fn address(res: usize) -> Option<usize> {
 
 /// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
 /// uploaded again.
-pub(super) unsafe fn refresh() {
+pub(super) unsafe fn refresh(queue: *mut c_void) {
     thread_local! {
         static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -92,18 +92,20 @@ pub(super) unsafe fn refresh() {
     if BUSY.with(|b| b.replace(true)) {
         return;
     }
-    refresh_once();
+    refresh_once(queue);
     BUSY.with(|b| b.set(false));
 }
 
-unsafe fn refresh_once() {
-    if TEXTURES.lock().unwrap().is_empty() {
+unsafe fn refresh_once(queue: *mut c_void) {
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let sparse = u.shader_windows() > u.windows();
+    if TEXTURES.lock().unwrap().is_empty() && !sparse {
         return;
     }
-    let Some(u) = crate::gpu::uma::get() else { return };
     let mut dirty: Vec<usize> = Vec::new();
     let mut page = 0x1000u32;
-    let regions: Vec<(usize, usize)> = (0..u.windows()).map(|k| u.window(k)).chain(crate::hle::kernelx::graphics_reservations()).collect();
+    // the committed windows, the sparse ones (the title's reservations) and other reservations
+    let regions: Vec<(usize, usize)> = (0..u.shader_windows()).map(|k| u.window(k)).chain(crate::hle::kernelx::graphics_reservations()).collect();
     for (base, size) in regions {
         loop {
             let mut buf = vec![std::ptr::null_mut::<c_void>(); 16384];
@@ -117,10 +119,14 @@ unsafe fn refresh_once() {
             }
         }
     }
+    dirty.sort_unstable();
+    // the title's own memory: what the CPU wrote goes to its video memory first
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        super::sparse::before_execute(q, &dirty, page as usize);
+    }
     if dirty.is_empty() {
         return;
     }
-    dirty.sort_unstable();
     // textures with a written page; a reference each while they are uploaded
     let todo: Vec<(ID3D12Resource, Upload)> = {
         let t = TEXTURES.lock().unwrap();

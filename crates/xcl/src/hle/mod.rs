@@ -17,6 +17,7 @@ pub mod dxcompiler;
 pub mod kernelx;
 pub mod mfplat;
 pub mod opus;
+pub mod user;
 pub mod xaudio2;
 pub mod xma2;
 pub mod xg;
@@ -93,7 +94,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),
         HleModule::new(MFPLAT, mfplat::exports(), &["mfplat.dll"]),
         HleModule::new(DXCOMPILER, dxcompiler::exports(), &[]),
-        HleModule::new(MINUSERX, Vec::new(), &["user32.dll"]),
+        HleModule::new(MINUSERX, user::exports(), &["user32.dll"]),
         HleModule::new(XCRDAPI, dstorage::exports(), &[]),
         HleModule::new(XG, xg::exports(), &[]),
     ];
@@ -147,6 +148,8 @@ fn build(config: &Config) -> Registry {
     routes.push((MFPLAT.into(), Route::Hle(mf)));
     let u = idx(MINUSERX);
     routes.push((MINUSERX.into(), Route::Hle(u)));
+    // the console's ntuser API sets: Windows' user32 but for the ANSI window functions (`user`)
+    routes.push(("ext-ms-win-rtcore-ntuser-window-ansi-*".into(), Route::Hle(u)));
     let s = idx(XCRDAPI);
     routes.push((XCRDAPI.into(), Route::Hle(s)));
     let g = idx(XG);

@@ -123,7 +123,66 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #42 / #44 / #46 SetGraphicsRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #38 /
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    note_address(va);
     put_in(this, true, i, 0, &va.to_le_bytes());
+}
+
+/// `XCL_TRACE_ADDRESSES=1`: root descriptor addresses of console code – in unified memory
+/// (translated shaders see them) or not – counted and logged
+fn note_address(va: u64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static IN: AtomicU64 = AtomicU64::new(0);
+    static OUT: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("XCL_TRACE_ADDRESSES").is_some()) {
+        return;
+    }
+    let inside = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
+    let (i, o) = if inside { (IN.fetch_add(1, Ordering::Relaxed) + 1, OUT.load(Ordering::Relaxed)) } else { (IN.load(Ordering::Relaxed), OUT.fetch_add(1, Ordering::Relaxed) + 1) };
+    if (i + o).is_power_of_two() {
+        crate::xlog_info!("D3D12.X: root descriptor addresses: {i} in unified memory, {o} outside (latest {va:#x})");
+    }
+}
+
+/// command signatures that change root arguments (they need the title's root signature)
+static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+pub(super) fn note_root_changing_signature(sig: usize) {
+    ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
+}
+
+/// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
+/// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
+/// arguments themselves cannot be – skipped, logged)
+pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
+    let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
+    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    if !gfx && !compute {
+        return pc(this, sig, max, args, args_off, count_buf, count_off);
+    }
+    if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
+        }
+        return;
+    }
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    match bind_abi(this, list, pso, gfx) {
+        Ok(()) => {
+            count(if gfx { DRAWS } else { DISPATCHES });
+            pc(this, sig, max, args, args_off, count_buf, count_off)
+        }
+        Err(e) => {
+            count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
+            }
+        }
+    }
 }
 
 /// #12 DrawInstanced
@@ -197,6 +256,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #41 / #43 / #45 SetComputeRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #37 /
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    note_address(va);
     put(this, i, 0, &va.to_le_bytes());
 }
 

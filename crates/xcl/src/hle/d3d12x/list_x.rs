@@ -927,12 +927,12 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
 
-    super::title_textures::refresh();
+    let q_raw = queue as *mut c_void;
+    super::title_textures::refresh(q_raw);
     if !waits.is_empty() {
         wait_all(&waits);
     }
 
-    let q_raw = queue as *mut c_void;
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
@@ -1141,6 +1141,25 @@ unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_V
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
 }
 
+const PC_IA_SET_VERTEX_BUFFERS: usize = 44;
+
+/// command list #48 IASetVertexBuffers(start slot, count, views) (PC #44): the addresses are
+/// the title's (its memory: the GPU address of that memory for the PC)
+pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, start: u32, n: u32, views: *const D3D12_VERTEX_BUFFER_VIEW) {
+    let f = pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS);
+    if views.is_null() || n == 0 {
+        return f(this, start, n, views);
+    }
+    let v: Vec<D3D12_VERTEX_BUFFER_VIEW> = (0..n as usize)
+        .map(|k| {
+            let mut v = views.add(k).read_unaligned();
+            v.BufferLocation = pc_va(v.BufferLocation);
+            v
+        })
+        .collect();
+    f(this, start, n, v.as_ptr())
+}
+
 /// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
 pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
     let mut g = LISTS.lock().unwrap();
@@ -1303,14 +1322,24 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    if let Some(d) = dst.as_ref() {
+        super::present::note_use(transmute_copy::<_, usize>(&d.pResource), super::present::USE_COPY);
+    }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
 }
 
+/// command list #83 CopyTextureRegionX(dst, x, y, z, src, box, flags): CopyTextureRegion with
+/// console copy flags (the title's texture streaming calls it where the DMA list gets #12)
+pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX, _flags: u32) {
+    copy_texture_region_x(this, dst, x, y, z, src, bx)
+}
+
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    super::present::note_use(dst, super::present::USE_COPY);
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);

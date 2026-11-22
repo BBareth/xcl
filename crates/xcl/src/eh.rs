@@ -61,6 +61,7 @@ pub fn set_title_filter(f: usize) -> usize {
 }
 
 unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+    crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
         let rec = &*(*info).ExceptionRecord;
         let addr = rec.ExceptionAddress as usize;

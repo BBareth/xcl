@@ -39,7 +39,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
         let (tx, rx) = mpsc::channel::<(Arc<Pending>, Job)>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get()).min(crate::gpu::recomp::dxc::MAX_COMPILE_THREADS);
         for k in 0..n {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {

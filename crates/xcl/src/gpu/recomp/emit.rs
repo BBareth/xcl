@@ -4360,7 +4360,7 @@ uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, selec
 const PRELUDE: &str = r#"
 static uint lane_id;
 // loop iterations a lane may run (`LOOP_GUARD`): far above what a working program needs
-static uint xcl_budget = 1u << 22;
+static uint xcl_budget = 1u << 16;
 // the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
 // `(uint)(((uint64_t)a * b) >> 32) != 0` (the console's integer division code) into
 // umul.with.overflow, which DXIL does not allow (validation fails)

@@ -1109,10 +1109,44 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   `note_alias`). GPU-owned textures (render target / depth / UAV flags) now go to *arenas*: default heaps standing for
   ranges of title addresses (from the 32 MiB below, at least 128 MiB), placed at their address's offset, so resources
   at one address share memory. ~16 arenas in XDefiant's first 25 s. Other textures stay committed and mirrored.
-- **XDefiant now**: frames 20 and 140 dumped (`XCL_FRAME_DUMP`) – the presented 3840x2160 R10G10B10A2 buffer is
-  entirely black; at ~25 s four engine threads read a null command-context member (+0x1358 of the object with vtable
-  +0x34dd7e0) at `+0x6859a1` – not out of video memory (the same with smaller arenas); cause open. Next: find which
-  pass first writes non-black (dump intermediate render targets / log clear colours), check the final composite.
+- **XDefiant now (2026-11-22)**: runs 90 s without a GPU hang and ends itself (`XCL_RUN_SECONDS`); ~1 500 console
+  shaders translated, thousands of draws and dispatches, nothing skipped. The presented 3840x2160 buffer is still
+  black: it is written by a compute pass through a UAV (never a render target); the scene / UI render targets are
+  (almost) black too – the title may be at its online-login gate (another implementer: it retries RTA / Ubisoft
+  services), or something in the frame is still wrong. ~2.3 frames per second: the sparse-window uploads cost ~30 ms
+  a submit (126 s in 4 096 submits) – next to optimise (no wait for idle per upload, cheaper dirty scan).
+- **What made the GPU hang** (four PC reboots – the AMD driver did not always recover from the TDR): vertex buffers.
+  Console #48 IASetVertexBuffers gave the title's addresses to the PC as GPU addresses – the index buffer was
+  translated, the vertex buffers were not (NaN in every render target, then device hangs). `ia_set_vertex_buffers_x`.
+- **Console-only list interfaces**: the title queries its lists for the console headers' ID3D12GraphicsCommandList5 /
+  6 – 55050859-4024-474c-98cf-645b51dc4874 / c3827890-4024-474c-98cf-645b51dc4874 (PC GCL5 / 6 end 87f5-6472eaee44ea /
+  e548-4cfa-96cf-5689a9370f80) – and copies the answer into its command context unchecked (null → crash after ~25 s).
+  The console list object answers them with itself (`title_list::CONSOLE_LIST_IIDS`).
+- **Console list #83 = CopyTextureRegionX**(dst, x, y, z, src, box, flags) – the title calls it where the DMA list
+  gets #12; it was a stub (texture uploads through the graphics list were lost). **#59 ExecuteIndirect** with a
+  translated pipeline binds XCL's ABI first (`bind::execute_indirect`; signatures that change root arguments skipped).
+- **Sparse windows** (`d3d12x::sparse`, `gpu::uma`): the title's own reservations of 64 KiB pages (VirtualAlloc
+  MEM_RESERVE | MEM_64K_PAGES, XDefiant's 8 GB pool) get addresses in UMA windows 1–3 (reserved only); on the GPU each
+  window is a 4 GiB reserved buffer whose 64 KiB tiles are mapped onto video-memory pool heaps as pages are committed.
+  The CPU view stays the title's memory; before each ExecuteCommandLists the CPU's writes (write-watch) go to the tiles
+  – only the 64-byte chunks that changed (`changed_chunks`: hashes of what was sent), so what the GPU wrote on the same
+  page is not overwritten – and the title's queue waits for that copy. Buffers placed there get reserved resources over
+  the same tiles. GPU writes are not copied back to the CPU view. Measured first (`tests/heap_probe.rs`): tiles of a
+  reserved buffer on default heaps work for a whole 4 GiB window; tiles mapped onto heaps opened from file mappings
+  removed the device (do not try again).
+- **Graphics root arguments** measured with the console compiler (`print_graphics_root_argument_placement` /
+  `_capacity`): VS / PS get them in user SGPRs s8…s31 (24), the rest in the table at s[0:1]; `bind` keeps the graphics
+  ones and binds them on draws; checked end to end by `console_compiled_graphics_reads_its_root_arguments`.
+- **Ending a run without a stuck process**: a host killed from outside with GPU work in flight stayed in the driver
+  holding 12–16 GB. `XCL_RUN_SECONDS=n` ends the title itself: every fence the title created is signalled to the
+  maximum (GPU waits on future values complete), the queues drain, then TerminateProcess (`real::end_title`). Shader
+  compiles: at most 6 at once and they wait while the system has < 6 GB of commit left (`dxc::wait_for_memory`).
+- **Window**: titles create their window with CreateWindowExA / RegisterClassExA but DefWindowProcW (its title showed
+  as CJK characters); `hle::user` makes them Unicode calls. The window stays white (console titles never paint it).
+- Diagnostics: `XCL_TRACE_FRAME=1` (what console code does with each presented resource; render-target binds, UAV
+  views of large render targets, clear colours; with `XCL_FRAME_DUMP` also the busiest render target and raw texel
+  histograms), `XCL_TRACE_ADDRESSES=1` (root descriptor addresses in / outside unified memory), `XCL_DRED=1` (DRED
+  page fault + breadcrumbs on a device removal – opt-in: twice the title stalled with it), `XCL_LIST_TRACE=1`.
 - **Notes from another implementer** (user-provided): XDefiant also calls XGCreateTextureComputerFromDescriptor, then
   libHttpClient / XCurl (XUserGetTokenAndSignature*, XNetworking) and retries wss://rta.xboxlive.com/connect every
   10–25 s; a 3D 120x68x64 RGBA16F resource / view returning E_INVALIDARG is not null-checked by the title.

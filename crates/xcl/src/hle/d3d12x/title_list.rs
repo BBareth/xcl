@@ -151,9 +151,27 @@ unsafe fn pc_slot(pc: *mut c_void, slot: usize) -> usize {
 }
 
 /// QueryInterface: the PC list answers; where it hands out itself, the console object goes out.
+/// Command list interfaces of the console's headers that the PC does not know: the console's
+/// ID3D12GraphicsCommandList5 / 6 (the PC's data1–data3, another tail – titles ask for them
+/// and use the answer without a check). The console object has the console's whole vtable,
+/// so it is the answer.
+const CONSOLE_LIST_IIDS: [(u32, u16, u16, [u8; 8]); 2] = [
+    (0x5505_0859, 0x4024, 0x474c, [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74]),
+    (0xc382_7890, 0x4024, 0x474c, [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74]),
+];
+
 unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 0));
+    if !riid.is_null() && !ppv.is_null() {
+        let g = &*riid;
+        if CONSOLE_LIST_IIDS.contains(&(g.data1, g.data2, g.data3, g.data4)) {
+            let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 1));
+            add_ref(pc);
+            *ppv = this;
+            return 0;
+        }
+    }
     let hr = f(pc, riid, ppv);
     if hr >= 0 && !ppv.is_null() && *ppv == pc {
         *ppv = this;
@@ -189,6 +207,10 @@ mod tests {
         *ppv = this;
         0
     }
+    unsafe extern "system" fn fake_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *mut Fake)).refs += 1;
+        (*(this as *mut Fake)).refs
+    }
     unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 {
         (*(this as *mut Fake)).refs -= 1;
         (*(this as *mut Fake)).refs
@@ -202,6 +224,7 @@ mod tests {
     fn console_list_objects_have_no_room_and_forward_to_the_pc_list() {
         let mut vt = vec![0usize; LIST_SLOTS];
         vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
         vt[2] = fake_release as usize;
         vt[20] = fake_this as usize;
         let fake = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
@@ -215,12 +238,18 @@ mod tests {
             // a method: the PC list's, with the PC list as `this` and the arguments kept
             let m: unsafe extern "system" fn(*mut c_void, u64, u64, u64, u64) -> u64 = std::mem::transmute(slot(20));
             assert_eq!(m(o, 1, 2, 3, 4), fake as u64 + 4321);
-            // QueryInterface hands out the console object
+            // QueryInterface hands out the console object – also for the console-only list IIDs
             let q: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(slot(0));
             let mut out = std::ptr::null_mut();
             assert_eq!(q(o, std::ptr::null(), &mut out), 0);
             assert_eq!(out, o);
+            let (d1, d2, d3, d4) = CONSOLE_LIST_IIDS[0];
+            let gcl5 = GUID { data1: d1, data2: d2, data3: d3, data4: d4 };
+            let mut out = std::ptr::null_mut();
+            assert_eq!(q(o, &gcl5, &mut out), 0);
+            assert_eq!(out, o);
             let r: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
+            assert_eq!(r(o), 2);
             assert_eq!(r(o), 1);
             assert_eq!(r(o), 0); // the object is freed with it
             drop(Box::from_raw(fake));

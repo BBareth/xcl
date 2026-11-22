@@ -215,3 +215,64 @@ fn heaps_over_sections_in_a_placeholder() {
         }
     }
 }
+
+
+/// A reserved (tiled) buffer of a whole memory window with some 64 KiB tiles mapped onto a
+/// default heap (video memory): uploaded data reads back through the window buffer.
+/// Standard tiled-resource use; GPU copies only.
+#[test]
+#[ignore]
+fn window_sized_reserved_buffer_on_video_memory_tiles() {
+    unsafe {
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+            return;
+        }
+        let dev = dev.unwrap();
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        for size in [4096u64 << 20, (4096u64 << 20) - 0x1_0000] {
+            let mut rbuf: Option<ID3D12Resource> = None;
+            let hr = dev.CreateReservedResource(&desc(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut rbuf);
+            let Some(rbuf) = rbuf.filter(|_| hr.is_ok()) else {
+                println!("reserved buffer of {} MiB: {hr:?}", size >> 20);
+                continue;
+            };
+            let pool_desc = D3D12_HEAP_DESC {
+                SizeInBytes: 64 << 20,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+            };
+            let mut pool: Option<ID3D12Heap> = None;
+            dev.CreateHeap(&pool_desc, &mut pool).unwrap();
+            let pool = pool.unwrap();
+            // tiles at the start, in the middle and the last one of the window
+            let last = (size / 0x1_0000 - 1) as u32;
+            let at = [0u32, 30_000, last];
+            for (k, &x) in at.iter().enumerate() {
+                let start = D3D12_TILED_RESOURCE_COORDINATE { X: x, ..Default::default() };
+                let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+                let (flags, heap_start, n) = (D3D12_TILE_RANGE_FLAG_NONE, k as u32, 1u32);
+                q.UpdateTileMappings(&rbuf, 1, Some(&start), Some(&region), &pool, 1, Some(&flags), Some(&heap_start), Some(&n), D3D12_TILE_MAPPING_FLAG_NONE);
+            }
+            let up = buffer(&dev, D3D12_HEAP_TYPE_UPLOAD, 3 * 0x1_0000, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut p = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).unwrap();
+            for i in 0..3 * 0x1_0000 / 4 {
+                *(p as *mut u32).add(i) = 0x7000_0000 | i as u32;
+            }
+            up.Unmap(0, None);
+            for (k, &x) in at.iter().enumerate() {
+                gpu_copy(&dev, &q, &rbuf, x as u64 * 0x1_0000, &up, k as u64 * 0x1_0000, 0x1_0000);
+            }
+            let rb = buffer(&dev, D3D12_HEAP_TYPE_READBACK, 3 * 0x1_0000, D3D12_RESOURCE_STATE_COPY_DEST);
+            for (k, &x) in at.iter().enumerate() {
+                gpu_copy(&dev, &q, &rb, k as u64 * 0x1_0000, &rbuf, x as u64 * 0x1_0000, 0x1_0000);
+            }
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let ok = (0..3 * 0x1_0000 / 4).all(|i| *(p as *const u32).add(i) == 0x7000_0000 | i as u32);
+            rb.Unmap(0, None);
+            println!("reserved buffer of {} MiB, GPU VA {:#x}: tiles 0 / 30000 / {last} on video memory read back: {ok}", size >> 20, rbuf.GetGPUVirtualAddress());
+        }
+    }
+}

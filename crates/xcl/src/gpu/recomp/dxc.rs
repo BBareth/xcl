@@ -115,20 +115,40 @@ struct Job {
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
-/// DXC workers (one per core, each with its own compiler and a `DXC_STACK` stack), started
-/// on first use; callers wait for their job.
+/// Compile threads at most: big translated programs take gigabytes each in DXC and the driver,
+/// and a title compiles hundreds at once – the machine must not run out of memory.
+pub const MAX_COMPILE_THREADS: usize = 6;
+
+/// Wait (up to a minute) while the system has less than 6 GB of commit left: a compile that
+/// would push it to the limit waits for the others to finish.
+pub fn wait_for_memory() {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let start = std::time::Instant::now();
+    loop {
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 6 << 30 || start.elapsed().as_secs() >= 60 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// DXC workers (one per core, at most `MAX_COMPILE_THREADS`, each with its own compiler and a
+/// `DXC_STACK` stack), started on first use; callers wait for their job.
 fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
     static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
     POOL.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        for k in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+        for k in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(MAX_COMPILE_THREADS) {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
                 let job = match rx.lock().unwrap().recv() {
                     Ok(j) => j,
                     Err(_) => return,
                 };
+                wait_for_memory();
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));

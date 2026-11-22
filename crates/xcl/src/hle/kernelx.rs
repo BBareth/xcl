@@ -146,7 +146,36 @@ const MEM_WRITE_WATCH: u32 = 0x20_0000;
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
 /// memory region the GPU uses directly (`gpu::uma`); a graphics reservation (no commit) is
 /// write-watched address space of Windows; everything else from Windows.
+/// The console's MEM_64K_PAGES (MEM_LARGE_PAGES | MEM_PHYSICAL): title memory of 64 KiB
+/// pages – GPU-visible on the console like all title memory.
+const MEM_64K_PAGES: u32 = 0x2040_0000;
+
+/// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
+/// memory (`d3d12x::sparse`).
+unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
+    let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
+    if !q.is_null() {
+        crate::hle::d3d12x::sparse::committed(q as usize, n);
+    }
+    q
+}
+
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    let uma = crate::gpu::uma::get();
+    // committing inside one of the title's reservations in a sparse window
+    if !addr.is_null() && t & 0x1000 != 0 && uma.is_some_and(|u| u.is_sparse(addr as usize)) {
+        return commit_sparse(addr as usize, size, p);
+    }
+    // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them
+    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
+        if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
+            if t & 0x1000 != 0 && commit_sparse(q, size, p).is_null() {
+                uma.map(|u| u.sparse_release(q));
+                return std::ptr::null_mut();
+            }
+            return q as *mut c_void;
+        }
+    }
     if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x1000 != 0 {
         if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(size, 0)) {
             return q as *mut c_void;
@@ -157,6 +186,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         // reserve a range, then commit or map pages and place resources in it): a range of
         // unified memory, which is committed already
         if let Some(q) = crate::gpu::uma::get().and_then(|u| u.reserve(size, 0x1_0000)) {
+            return q as *mut c_void;
+        }
+        if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
             return q as *mut c_void;
         }
         let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
@@ -182,6 +214,30 @@ fn trace_mem(what: &str, addr: usize, size: usize, flags: u64, protect: u32, got
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
 /// zeroes them); others to Windows.
 pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32) -> BOOL {
+    // the title's reservations in a sparse window: decommit (and on release give the address
+    // space back); their video memory goes with it
+    if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_sparse(addr as usize)) {
+        let a = addr as usize;
+        let n = if t & 0x8000 != 0 {
+            match u.sparse_reservation(a) {
+                Some((start, len)) if start == a => len,
+                _ => {
+                    fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+                    return 0;
+                }
+            }
+        } else {
+            size
+        };
+        if n > 0 {
+            mem::VirtualFree(addr, n, mem::MEM_DECOMMIT);
+            crate::hle::d3d12x::sparse::decommitted(a, n);
+        }
+        if t & 0x8000 != 0 {
+            u.sparse_release(a);
+        }
+        return 1;
+    }
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(addr as usize)) {
         if t & 0x8000 != 0 {
             return u.free(addr as usize) as BOOL;
@@ -533,7 +589,10 @@ unsafe fn unmap_away(away: &mut Away, at: usize) {
         if let Some(home) = page_home(page) {
             std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
         }
-        if !crate::gpu::uma::get().is_some_and(|u| u.contains(at)) {
+        if !crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
+            if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
+                crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
+            }
             mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
         }
     }
@@ -626,7 +685,7 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
-    let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.contains(a));
+    let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.is_committed(a));
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
         unmap_away(away, at);
@@ -641,6 +700,9 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
             return std::ptr::null_mut();
         }
         std::ptr::copy_nonoverlapping(page_home(p).unwrap() as *const u8, at as *mut u8, PHYS_PAGE);
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
+            crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+        }
         away.at.insert(at, p);
         away.page.insert(p, at);
     }

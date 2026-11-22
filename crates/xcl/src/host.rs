@@ -29,6 +29,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
+    // report written (a process killed from outside with GPU work in flight can hang in the driver)
+    if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title");
+            crate::report::write_final(None);
+            crate::log::flush();
+            crate::hle::d3d12x::real::end_title(0);
+        });
+    }
     crate::stubs::init_db(&boot.config.stub_returns);
     crate::hle::init(&boot.config);
     crate::loader::set_cache_dir(boot.cache_dir());
